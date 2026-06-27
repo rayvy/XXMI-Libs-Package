@@ -6,6 +6,7 @@
 
 #include <DDSTextureLoader.h>
 #include <WICTextureLoader.h>
+#include <chrono>
 #include <algorithm>
 #include <sstream>
 #include "HackerDevice.h"
@@ -868,6 +869,126 @@ bail:
 	return false;
 }
 
+static bool ParseFrameAnalysisSave(const wchar_t *section,
+		const wchar_t *key, wstring *val,
+		CommandList *explicit_command_list,
+		CommandList *pre_command_list,
+		CommandList *post_command_list,
+		const wstring *ini_namespace)
+{
+	FrameAnalysisSaveCommand *operation = new FrameAnalysisSaveCommand();
+	wchar_t *buf;
+	size_t size = val->size() + 1;
+
+	buf = new wchar_t[size];
+	wcscpy_s(buf, size, val->c_str());
+
+	wchar_t *ptr = buf;
+	wchar_t *target_token = nullptr;
+	wchar_t *filepath_start = nullptr;
+
+	operation->analyse_options = (FrameAnalysisOptions)0;
+
+	while (*ptr) {
+		// Skip whitespace:
+		while (*ptr == L' ' || *ptr == L'\t') {
+			ptr++;
+		}
+		if (!*ptr)
+			break;
+
+		// Start of current token:
+		wchar_t *token_start = ptr;
+
+		// Scan until next whitespace or end:
+		while (*ptr && *ptr != L' ' && *ptr != L'\t') {
+			ptr++;
+		}
+
+		// Null-terminate the token temporarily so we can lookup/parse:
+		wchar_t saved_char = *ptr;
+		*ptr = L'\0';
+
+		FrameAnalysisOptions opt = lookup_enum_val<wchar_t *, FrameAnalysisOptions>(
+			FrameAnalysisOptionNames, token_start, FrameAnalysisOptions::INVALID);
+
+		if (opt != FrameAnalysisOptions::INVALID) {
+			operation->analyse_options |= opt;
+			// Restore character and continue:
+			*ptr = saved_char;
+		} else {
+			// This is our target!
+			target_token = token_start;
+			// Null terminate target_token at the end of the token:
+			*ptr = L'\0';
+			// filepath start is the rest of the string:
+			filepath_start = ptr + 1;
+			break;
+		}
+	}
+
+	if (!target_token || !filepath_start)
+		goto bail;
+
+	// Extract filepath
+	{
+		wchar_t *filepath = filepath_start;
+		while (*filepath == L' ' || *filepath == L'\t' || *filepath == L'"') {
+			filepath++;
+		}
+		size_t filepath_len = wcslen(filepath);
+		while (filepath_len > 0 && (filepath[filepath_len - 1] == L' ' || filepath[filepath_len - 1] == L'\t' || filepath[filepath_len - 1] == L'"' || filepath[filepath_len - 1] == L'\r' || filepath[filepath_len - 1] == L'\n')) {
+			filepath[filepath_len - 1] = L'\0';
+			filepath_len--;
+		}
+
+		if (filepath_len == 0)
+			goto bail;
+
+		// Block absolute paths or directory traversal (security sandbox)
+		if (wcsstr(filepath, L"..") || wcsstr(filepath, L":") || filepath[0] == L'\\' || filepath[0] == L'/')
+			goto bail;
+
+		wstring namespace_path;
+		get_namespaced_section_path(section, &namespace_path);
+		wchar_t full_path[MAX_PATH];
+		GetModuleFileName(migoto_handle, full_path, MAX_PATH);
+		wcsrchr(full_path, L'\\')[1] = 0;
+
+		wstring resolved_template;
+		if (filepath[0] == L'.' && (filepath[1] == L'\\' || filepath[1] == L'/')) {
+			resolved_template = wstring(full_path) + (filepath + 2);
+		} else if (filepath[0] != L'\0' && filepath[1] != L':' && filepath[0] != L'\\' && filepath[0] != L'/') {
+			resolved_template = wstring(full_path) + namespace_path + filepath;
+		} else {
+			resolved_template = filepath;
+		}
+		operation->save_filepath_template = resolved_template;
+	}
+
+	if (!operation->target.ParseTarget(target_token, true, ini_namespace, pre_command_list->scope))
+		goto bail;
+
+	operation->target_name = L"[" + wstring(section) + L"]-" + wstring(target_token);
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'<', L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'>', L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L':', L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'"', L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'/', L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'\\',L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'|', L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'?', L'_');
+	std::replace(operation->target_name.begin(), operation->target_name.end(), L'*', L'_');
+
+	delete [] buf;
+	return AddCommandToList(operation, explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
+
+bail:
+	delete [] buf;
+	delete operation;
+	return false;
+}
+
 bool ParseStoreCommand(const wchar_t* section,
 	const wchar_t* key, wstring* val,
 	CommandList* explicit_command_list,
@@ -975,6 +1096,9 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
 
 	if (!wcscmp(key, L"dump"))
 		return ParseFrameAnalysisDump(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
+
+	if (!wcscmp(key, L"save"))
+		return ParseFrameAnalysisSave(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
 
 	if (!wcscmp(key, L"special")) {
 		if (!wcscmp(val->c_str(), L"upscaling_switch_bb"))
@@ -1586,6 +1710,9 @@ void FrameAnalysisDumpCommand::run(CommandListState *state)
 	UINT buf_size = 0;
 	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 
+	if (!G->export_command_list_dump)
+		return;
+
 	// Fast exit if frame analysis is currently inactive:
 	if (!G->analyse_frame)
 		return;
@@ -1613,7 +1740,127 @@ void FrameAnalysisDumpCommand::run(CommandListState *state)
 
 bool FrameAnalysisDumpCommand::noop(bool post, bool ignore_cto_pre, bool ignore_cto_post)
 {
-	return (G->hunting == HUNTING_MODE_DISABLED || G->frame_analysis_registered == false);
+	return !G->export_command_list_dump || (G->hunting == HUNTING_MODE_DISABLED || G->frame_analysis_registered == false);
+}
+
+static wstring FormatSavePath(const wstring &template_path, CommandListState *state)
+{
+	wstring result = template_path;
+
+	SYSTEMTIME lt;
+	GetLocalTime(&lt);
+
+	wchar_t date_str[32];
+	swprintf_s(date_str, L"%04u-%02u-%02u", lt.wYear, lt.wMonth, lt.wDay);
+
+	wchar_t time_str[32];
+	swprintf_s(time_str, L"%02u-%02u-%02u", lt.wHour, lt.wMinute, lt.wSecond);
+
+	wchar_t ms_str[32];
+	swprintf_s(ms_str, L"%03u", lt.wMilliseconds);
+
+	auto now = std::chrono::high_resolution_clock::now();
+	auto duration = now.time_since_epoch();
+	auto micros = std::chrono::duration_cast<std::chrono::microseconds>(duration).count() % 1000000;
+	wchar_t us_str[32];
+	swprintf_s(us_str, L"%06llu", micros);
+
+	wchar_t frame_str[32];
+	swprintf_s(frame_str, L"%u", G->frame_no);
+
+	wchar_t draw_str[32];
+	swprintf_s(draw_str, L"%u", state->mHackerContext ? state->mHackerContext->GetDrawCall() : 0);
+
+	auto replace_all = [](wstring &str, const wstring &from, const wstring &to) {
+		size_t start_pos = 0;
+		while ((start_pos = str.find(from, start_pos)) != wstring::npos) {
+			str.replace(start_pos, from.length(), to);
+			start_pos += to.length();
+		}
+	};
+
+	replace_all(result, L"%DATE%", date_str);
+	replace_all(result, L"%date%", date_str);
+	replace_all(result, L"%TIME%", time_str);
+	replace_all(result, L"%time%", time_str);
+	replace_all(result, L"%MS%", ms_str);
+	replace_all(result, L"%ms%", ms_str);
+	replace_all(result, L"%US%", us_str);
+	replace_all(result, L"%us%", us_str);
+	replace_all(result, L"%FRAME%", frame_str);
+	replace_all(result, L"%frame%", frame_str);
+	replace_all(result, L"%DRAW%", draw_str);
+	replace_all(result, L"%draw%", draw_str);
+
+	size_t start_pos = 0;
+	while ((start_pos = result.find(L'%', start_pos)) != wstring::npos) {
+		size_t end_pos = result.find(L'%', start_pos + 1);
+		if (end_pos == wstring::npos)
+			break;
+
+		wstring var_name = result.substr(start_pos + 1, end_pos - start_pos - 1);
+		if (var_name != L"DATE" && var_name != L"date" &&
+			var_name != L"TIME" && var_name != L"time" &&
+			var_name != L"MS" && var_name != L"ms" &&
+			var_name != L"US" && var_name != L"us" &&
+			var_name != L"FRAME" && var_name != L"frame" &&
+			var_name != L"DRAW" && var_name != L"draw") {
+			wstring var_name_lower = var_name;
+			std::transform(var_name_lower.begin(), var_name_lower.end(), var_name_lower.begin(), ::tolower);
+			auto it = command_list_globals.find(var_name_lower);
+			if (it != command_list_globals.end()) {
+				wchar_t val_str[64];
+				if (it->second.fval == (int)it->second.fval) {
+					swprintf_s(val_str, L"%i", (int)it->second.fval);
+				} else {
+					swprintf_s(val_str, L"%f", it->second.fval);
+				}
+				result.replace(start_pos, end_pos - start_pos + 1, val_str);
+				start_pos += wcslen(val_str);
+				continue;
+			}
+		}
+		start_pos = end_pos + 1;
+	}
+
+	return result;
+}
+
+void FrameAnalysisSaveCommand::run(CommandListState *state)
+{
+	ID3D11Resource *resource = NULL;
+	ID3D11View *view = NULL;
+	UINT stride = 0;
+	UINT offset = 0;
+	UINT buf_size = 0;
+	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+	if (!G->export_command_list_save)
+		return;
+
+	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+	resource = target.GetResource(state, &view, &stride, &offset, &format, NULL);
+	if (!resource) {
+		COMMAND_LIST_LOG(state, "  No resource to save\n");
+		return;
+	}
+
+	FillInMissingInfo(target.type, resource, view, &stride, &offset, &buf_size, &format);
+
+	wstring resolved_filepath = FormatSavePath(save_filepath_template, state);
+
+	state->mHackerContext->FrameAnalysisSave(resource, analyse_options, resolved_filepath.c_str(), format, stride, offset);
+
+	if (resource)
+		resource->Release();
+	if (view)
+		view->Release();
+}
+
+bool FrameAnalysisSaveCommand::noop(bool post, bool ignore_cto_pre, bool ignore_cto_post)
+{
+	return !G->export_command_list_save;
 }
 
 UpscalingFlipBBCommand::UpscalingFlipBBCommand(wstring section) :
@@ -6469,7 +6716,7 @@ void ResourceCopyTarget::FindTextureOverrides(CommandListState *state, bool *res
 
 	// For vertex and index buffers the game may pack multiple meshes into
 	// one buffer and bind them at different offsets. In that case the base
-	// resource hash alone is not enough – we must use the same region data hash 
+	// resource hash alone is not enough Â– we must use the same region data hash 
 	// that IASetVertexBuffers / IASetIndexBuffer computed and stored in 
 	// mCurrentVertexBuffers[] /mCurrentIndexBuffer, and that the hunting overlay displays.
 	// That way the hash the user copies from the overlay matches the one looked up

@@ -8,6 +8,8 @@
 #include "Globals.h"
 #include "input.h"
 
+#include <chrono>
+
 #include <ScreenGrab.h>
 #include <wincodec.h>
 #include <Strsafe.h>
@@ -3009,6 +3011,202 @@ void FrameAnalysisContext::FrameAnalysisDump(ID3D11Resource *resource, FrameAnal
 	LeaveCriticalSection(&G->mCriticalSection);
 
 	non_draw_call_dump_counter++;
+}
+
+static void CreateDirectoryRecursive(const wstring &path)
+{
+	wchar_t folder[MAX_PATH];
+	wcsncpy_s(folder, path.c_str(), MAX_PATH);
+
+	wchar_t *last_slash = wcsrchr(folder, L'\\');
+	if (last_slash) {
+		*last_slash = L'\0';
+	} else {
+		last_slash = wcsrchr(folder, L'/');
+		if (last_slash) {
+			*last_slash = L'\0';
+		} else {
+			return; // no separator, folder is current dir
+		}
+	}
+
+	wchar_t current[MAX_PATH] = { 0 };
+	wchar_t *part = folder;
+	wchar_t *next_slash = NULL;
+
+	if (wcslen(part) >= 2 && part[1] == L':') {
+		wcsncpy_s(current, part, 3);
+		part += 3;
+	}
+
+	while (true) {
+		wchar_t *slash_backslash = wcschr(part, L'\\');
+		wchar_t *slash_forward = wcschr(part, L'/');
+		
+		if (slash_backslash && slash_forward) {
+			next_slash = (slash_backslash < slash_forward) ? slash_backslash : slash_forward;
+		} else {
+			next_slash = slash_backslash ? slash_backslash : slash_forward;
+		}
+
+		if (!next_slash)
+			break;
+
+		*next_slash = L'\0';
+		wcsncat_s(current, part, MAX_PATH);
+		wcsncat_s(current, L"\\", MAX_PATH);
+		CreateDirectoryEnsuringAccess(current);
+		part = next_slash + 1;
+	}
+
+	if (*part != L'\0') {
+		wcsncat_s(current, part, MAX_PATH);
+		CreateDirectoryEnsuringAccess(current);
+	}
+}
+
+void FrameAnalysisContext::FrameAnalysisSave(ID3D11Resource *resource, FrameAnalysisOptions options,
+		const wchar_t *custom_filepath, DXGI_FORMAT format, UINT stride, UINT offset)
+{
+	if (!resource) {
+		FALogErr(L"FrameAnalysisSave: Resource is NULL, skipping save to %ls\n", custom_filepath);
+		return;
+	}
+
+	D3D11_RESOURCE_DIMENSION dim;
+	HRESULT hr;
+
+	CreateDirectoryRecursive(custom_filepath);
+
+	resource->GetType(&dim);
+
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	setlocale(LC_CTYPE, "en_US.UTF-8");
+	
+	FrameAnalysisOptions old_analyse_options = analyse_options;
+	// If no format is specified in options, infer from extension
+	if (!((int)options & ((int)FrameAnalysisOptions::FMT_2D_MASK | (int)FrameAnalysisOptions::FMT_BUF_MASK))) {
+		wstring path_str = custom_filepath;
+		size_t dot = path_str.find_last_of(L'.');
+		if (dot != wstring::npos) {
+			wstring ext = path_str.substr(dot + 1);
+			for (auto &c : ext) {
+				c = ::towlower(c);
+			}
+			if (ext == L"dds") {
+				options |= FrameAnalysisOptions::FMT_2D_DDS;
+			} else if (ext == L"jpg" || ext == L"jpeg" || ext == L"png") {
+				options |= FrameAnalysisOptions::FMT_2D_AUTO;
+			} else if (ext == L"txt") {
+				options |= FrameAnalysisOptions::FMT_BUF_TXT;
+			} else if (ext == L"bin" || ext == L"buf") {
+				options |= FrameAnalysisOptions::FMT_BUF_BIN;
+			}
+		}
+	}
+	analyse_options = options;
+
+	switch (dim) {
+		case D3D11_RESOURCE_DIMENSION_BUFFER:
+		{
+			ID3D11Buffer *buffer = (ID3D11Buffer*)resource;
+			D3D11_BUFFER_DESC desc, orig_desc;
+			ID3D11Buffer *staging = NULL;
+
+			buffer->GetDesc(&desc);
+			memcpy(&orig_desc, &desc, sizeof(D3D11_BUFFER_DESC));
+
+			desc.Usage = D3D11_USAGE_STAGING;
+			desc.BindFlags = 0;
+			desc.MiscFlags = 0;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+			LockResourceCreationMode();
+			hr = GetHackerDevice()->GetPassThroughOrigDevice1()->CreateBuffer(&desc, NULL, &staging);
+			UnlockResourceCreationMode();
+			if (SUCCEEDED(hr)) {
+				GetDumpingContext()->CopyResource(staging, buffer);
+				
+				D3D11_MAPPED_SUBRESOURCE map;
+				hr = GetDumpingContext()->Map(staging, 0, D3D11_MAP_READ, 0, &map);
+				if (SUCCEEDED(hr)) {
+					if (options & FrameAnalysisOptions::FMT_BUF_BIN) {
+						FILE *fd = NULL;
+						errno_t err = wfopen_ensuring_access(&fd, custom_filepath, L"wb");
+						if (fd) {
+							fwrite(map.pData, 1, orig_desc.ByteWidth, fd);
+							fclose(fd);
+						} else {
+							FALogErr(L"Unable to create %ls: %u\n", custom_filepath, err);
+						}
+					}
+					if (options & FrameAnalysisOptions::FMT_BUF_TXT) {
+						char type_char = 'c';
+						if (options & FrameAnalysisOptions::DUMP_VB) type_char = 'v';
+						else if (options & FrameAnalysisOptions::DUMP_IB) type_char = 'i';
+						
+						DumpBufferTxt(const_cast<wchar_t*>(custom_filepath), &map, orig_desc.ByteWidth, type_char, -1, stride, offset);
+					}
+					GetDumpingContext()->Unmap(staging, 0);
+				} else {
+					FALogErr(L"FrameAnalysisSave failed to map staging resource: 0x%x\n", hr);
+				}
+				staging->Release();
+			} else {
+				FALogErr(L"FrameAnalysisSave failed to create staging buffer: 0x%x\n", hr);
+			}
+			break;
+		}
+		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+		{
+			ID3D11Texture2D *tex = (ID3D11Texture2D*)resource;
+			ID3D11Texture2D *staging = tex;
+			D3D11_TEXTURE2D_DESC staging_desc;
+
+			tex->GetDesc(&staging_desc);
+			if ((staging_desc.Usage != D3D11_USAGE_STAGING) || !(staging_desc.CPUAccessFlags & D3D11_CPU_ACCESS_READ) || (staging_desc.Format != format)) {
+				hr = StageResource(tex, &staging_desc, &staging, format);
+				if (FAILED(hr)) {
+					analyse_options = old_analyse_options;
+					setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+					LeaveCriticalSection(&G->mCriticalSection);
+					return;
+				}
+			}
+
+			CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+			if (options & FrameAnalysisOptions::FMT_2D_JPS || options & FrameAnalysisOptions::FMT_2D_AUTO) {
+				wstring path_str = custom_filepath;
+				GUID container_format = GUID_ContainerFormatJpeg;
+				if (path_str.size() >= 4 && _wcsicmp(path_str.substr(path_str.size() - 4).c_str(), L".png") == 0) {
+					container_format = GUID_ContainerFormatPng;
+				}
+				hr = DirectX::SaveWICTextureToFile(GetDumpingContext(), staging, container_format, custom_filepath);
+				if (FAILED(hr)) {
+					FALogErr(L"Failed to save WIC texture to %ls: 0x%x\n", custom_filepath, hr);
+				}
+			} else if (options & FrameAnalysisOptions::FMT_2D_DDS) {
+				hr = DirectX::SaveDDSTextureToFile(GetDumpingContext(), staging, custom_filepath);
+				if (FAILED(hr)) {
+					FALogErr(L"Failed to save DDS texture to %ls: 0x%x\n", custom_filepath, hr);
+				}
+			}
+
+			CoUninitialize();
+
+			if (staging != tex)
+				staging->Release();
+			break;
+		}
+		default:
+			FALogInfo(L"Skipped saving resource of unsupported type %i: %ls\n", dim, custom_filepath);
+			break;
+	}
+
+	analyse_options = old_analyse_options;
+	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+	LeaveCriticalSection(&G->mCriticalSection);
 }
 
 // -----------------------------------------------------------------------------------------------
