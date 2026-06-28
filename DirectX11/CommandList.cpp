@@ -19,6 +19,8 @@
 #include "cursor.h"
 
 #include <D3DCompiler.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 
 CustomResources customResources;
 CustomResourcePools customResourcePools;
@@ -869,6 +871,79 @@ bail:
 	return false;
 }
 
+static bool ParsePlaySoundCommand(const wchar_t *section,
+		const wchar_t *key, wstring *val,
+		CommandList *explicit_command_list,
+		CommandList *pre_command_list,
+		CommandList *post_command_list,
+		const wstring *ini_namespace)
+{
+	PlaySoundCommand *operation = new PlaySoundCommand();
+	wchar_t *buf;
+	size_t size = val->size() + 1;
+
+	buf = new wchar_t[size];
+	wcscpy_s(buf, size, val->c_str());
+
+	wchar_t *filepath = buf;
+	while (*filepath == L' ' || *filepath == L'\t') {
+		filepath++;
+	}
+
+	// Parse optional cooldown
+	if (iswdigit(*filepath)) {
+		wchar_t *endptr = nullptr;
+		DWORD val_parsed = wcstoul(filepath, &endptr, 10);
+		if (endptr != filepath && (*endptr == L' ' || *endptr == L'\t')) {
+			operation->cooldown = val_parsed;
+			filepath = endptr;
+		}
+	}
+
+	while (*filepath == L' ' || *filepath == L'\t' || *filepath == L'"') {
+		filepath++;
+	}
+
+	size_t filepath_len = wcslen(filepath);
+	while (filepath_len > 0 && (filepath[filepath_len - 1] == L' ' || filepath[filepath_len - 1] == L'\t' || filepath[filepath_len - 1] == L'"' || filepath[filepath_len - 1] == L'\r' || filepath[filepath_len - 1] == L'\n')) {
+		filepath[filepath_len - 1] = L'\0';
+		filepath_len--;
+	}
+
+	if (filepath_len == 0)
+		goto bail;
+
+	// Block absolute paths or directory traversal (security sandbox)
+	if (wcsstr(filepath, L"..") || wcsstr(filepath, L":") || filepath[0] == L'\\' || filepath[0] == L'/')
+		goto bail;
+
+	{
+		wstring namespace_path;
+		get_namespaced_section_path(section, &namespace_path);
+		wchar_t full_path[MAX_PATH];
+		GetModuleFileName(migoto_handle, full_path, MAX_PATH);
+		wcsrchr(full_path, L'\\')[1] = 0;
+
+		wstring resolved_template;
+		if (filepath[0] == L'.' && (filepath[1] == L'\\' || filepath[1] == L'/')) {
+			resolved_template = wstring(full_path) + (filepath + 2);
+		} else if (filepath[0] != L'\0' && filepath[1] != L':' && filepath[0] != L'\\' && filepath[0] != L'/') {
+			resolved_template = wstring(full_path) + namespace_path + filepath;
+		} else {
+			resolved_template = filepath;
+		}
+		operation->sound_filepath_template = resolved_template;
+	}
+
+	delete [] buf;
+	return AddCommandToList(operation, explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
+
+bail:
+	delete [] buf;
+	delete operation;
+	return false;
+}
+
 static bool ParseFrameAnalysisSave(const wchar_t *section,
 		const wchar_t *key, wstring *val,
 		CommandList *explicit_command_list,
@@ -1099,6 +1174,9 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
 
 	if (!wcscmp(key, L"save"))
 		return ParseFrameAnalysisSave(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
+
+	if (!wcscmp(key, L"playsound"))
+		return ParsePlaySoundCommand(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
 
 	if (!wcscmp(key, L"special")) {
 		if (!wcscmp(val->c_str(), L"upscaling_switch_bb"))
@@ -1861,6 +1939,73 @@ void FrameAnalysisSaveCommand::run(CommandListState *state)
 bool FrameAnalysisSaveCommand::noop(bool post, bool ignore_cto_pre, bool ignore_cto_post)
 {
 	return !G->export_command_list_save;
+}
+
+PlaySoundCommand::PlaySoundCommand() :
+	cooldown(1000),
+	last_play_time(0)
+{
+}
+
+void PlaySoundCommand::run(CommandListState *state)
+{
+	if (!G->enable_command_list_sound)
+		return;
+
+	ULONGLONG now = GetTickCount64();
+	if (now - last_play_time < cooldown)
+		return;
+
+	last_play_time = now;
+
+	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+	wstring resolved_filepath = FormatSavePath(sound_filepath_template, state);
+
+	// Check if the file is a .wav file
+	size_t dot_pos = resolved_filepath.rfind(L'.');
+	if (dot_pos == wstring::npos || _wcsicmp(resolved_filepath.c_str() + dot_pos, L".wav") != 0) {
+		LogOverlayW(LOG_WARNING, L"playsound error: Only PCM .wav files are supported.\n  File: '%ls'\n", resolved_filepath.c_str());
+		LogInfoW(L"playsound error: Only .wav files are supported. File: '%ls'\n", resolved_filepath.c_str());
+		return;
+	}
+
+	// Verify file existence
+	DWORD attrib = GetFileAttributesW(resolved_filepath.c_str());
+	if (attrib == INVALID_FILE_ATTRIBUTES || (attrib & FILE_ATTRIBUTE_DIRECTORY)) {
+		LogOverlayW(LOG_WARNING, L"playsound error: File not found:\n  '%ls'\n", resolved_filepath.c_str());
+		LogInfoW(L"playsound error: File not found: '%ls'\n", resolved_filepath.c_str());
+		return;
+	}
+
+	// Verify RIFF header to catch renamed MP3s/OGGs
+	HANDLE hFile = CreateFileW(resolved_filepath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile != INVALID_HANDLE_VALUE) {
+		char header[4] = {0};
+		DWORD bytesRead = 0;
+		if (ReadFile(hFile, header, 4, &bytesRead, NULL) && bytesRead == 4) {
+			if (header[0] != 'R' || header[1] != 'I' || header[2] != 'F' || header[3] != 'F') {
+				LogOverlayW(LOG_WARNING, L"playsound error: File is not a valid WAVE file (invalid RIFF header).\n  File: '%ls'\n", resolved_filepath.c_str());
+				LogInfoW(L"playsound error: File is not a valid WAVE file (invalid RIFF header). File: '%ls'\n", resolved_filepath.c_str());
+				CloseHandle(hFile);
+				return;
+			}
+		}
+		CloseHandle(hFile);
+	}
+
+	LogInfoW(L"playsound: Playing sound file '%ls'\n", resolved_filepath.c_str());
+
+	BOOL success = PlaySoundW(resolved_filepath.c_str(), NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+	if (!success) {
+		LogOverlayW(LOG_WARNING, L"playsound error: PlaySoundW API failed for:\n  '%ls'\n", resolved_filepath.c_str());
+		LogInfoW(L"playsound error: PlaySoundW API failed for: '%ls'\n", resolved_filepath.c_str());
+	}
+}
+
+bool PlaySoundCommand::noop(bool post, bool ignore_cto_pre, bool ignore_cto_post)
+{
+	return !G->enable_command_list_sound;
 }
 
 UpscalingFlipBBCommand::UpscalingFlipBBCommand(wstring section) :

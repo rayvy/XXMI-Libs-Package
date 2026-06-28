@@ -469,6 +469,7 @@ struct Globals
 	int EXPORT_HLSL;		// 0=off, 1=HLSL only, 2=HLSL+OriginalASM, 3= HLSL+OriginalASM+recompiledASM
 	bool EXPORT_SHADERS, EXPORT_FIXED, EXPORT_BINARY, CACHE_SHADERS, SCISSOR_DISABLE;
 	bool export_command_list_dump, export_command_list_save;
+	bool enable_command_list_sound;
 	int track_texture_updates;
 	bool assemble_signature_comments;
 	bool disassemble_undecipherable_custom_data;
@@ -682,6 +683,7 @@ struct Globals
 		CACHE_SHADERS(false),
 		export_command_list_dump(true),
 		export_command_list_save(true),
+		enable_command_list_sound(true),
 		DumpUsage(false),
 		ENABLE_TUNE(false),
 		gTuneStep(0.001f),

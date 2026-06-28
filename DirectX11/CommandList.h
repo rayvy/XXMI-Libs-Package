@@ -1255,6 +1255,18 @@ public:
 	bool noop(bool post, bool ignore_cto_pre, bool ignore_cto_post) override;
 };
 
+class PlaySoundCommand : public CommandListCommand {
+public:
+	wstring sound_filepath_template;
+	DWORD cooldown;
+	ULONGLONG last_play_time;
+
+	PlaySoundCommand();
+
+	void run(CommandListState*) override;
+	bool noop(bool post, bool ignore_cto_pre, bool ignore_cto_post) override;
+};
+
 class UpscalingFlipBBCommand : public CommandListCommand {
 public:
 	wstring ini_section;

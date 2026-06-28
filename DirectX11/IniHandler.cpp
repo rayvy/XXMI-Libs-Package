@@ -4424,6 +4424,7 @@ void LoadConfigFile()
 	G->DumpUsage = GetIniBool(L"Rendering", L"dump_usage", false, NULL);
 	G->export_command_list_dump = GetIniBool(L"Rendering", L"export_command_list_dump", true, NULL);
 	G->export_command_list_save = GetIniBool(L"Rendering", L"export_command_list_save", true, NULL);
+	G->enable_command_list_sound = GetIniBool(L"Rendering", L"enable_command_list_sound", true, NULL);
 
 	G->IniParamsReg = GetIniInt(L"Rendering", L"ini_params", 120, NULL);
 	G->decompiler_settings.IniParamsReg = G->IniParamsReg;
